@@ -1,164 +1,161 @@
-import json
+import os
 
-from flask import Flask, request, jsonify, abort
-
-
-db = {
-    "users": {},
-    "roles": {},
-}
-
-
-def create_user(
-    db,
-    user_name,
-    user_password,
-    complete_name,
-    company_name,
-    company_position,
-    email_address,
-    initial_roles=[],
-    is_admin=False,
-    work_address=None,
-    telephone_number=None,
-):
-    is_unique_name = (
-        True
-        if not list(filter(lambda val: val == user_name), db["users"].keys())
-        else False
-    )
-
-    if not is_unique_name:
-        raise ValueError(f"user_name: f{user_name} already exists")
-
-    user = {
-        "user_name": user_name,
-        "is_admin": is_admin,
-        "user_password": user_password,
-        "complete_name": complete_name,
-        "company_name": company_name,
-        "company_position": company_position,
-        "email_address": email_address,
-        "work_address": work_address,
-        "telephone_numer": telephone_number,
-        "roles": initial_roles,
-    }
-
-    db["users"][user_name](user)
-
-
-def is_admin(db, user_name):
-    return db["user"][user_name]["is_admin"]
-
-
-def create_role(db, role_name):
-    is_unique_role = (
-        True
-        if not list(filter(lambda val: val == role_name, db["roles"].keys()))
-        else False
-    )
-
-    if not is_unique_role:
-        raise ValueError(f"role_name: {role_name} already exists")
-
-    role = {"role_name": role_name}
-
-    db["roles"]["role_name"] = role
-
-
-def add_role_to_user(db, user_name, role_name):
-    role_exists = (
-        True
-        if list(filter(lambda val: val == role_name, db["roles"].keys()))
-        else False
-    )
-    user_exists = (
-        True
-        if list(filter(lambda val: val == user_name, db["users"].keys()))
-        else False
-    )
-
-    if not (role_exists or user_exists):
-        raise ValueError(
-            f"role_name: {role_name} or user_name: {user_name} does not exist in the db."
-        )
-
-    db["users"][user_name]["roles"].append(role_name)
-
-
-def authenticate_user(db, user_name, user_password):
-    user_exists = (
-        True
-        if list(filter(lambda val: val == user_name, db["users"].keys()))
-        else False
-    )
-
-    if user_exists:
-        raise ValueError(f"user_name: {user_name} does not exist in the db.")
-
-    return db["users"][user_name]["user_password"] == user_password
-
-
-def is_user_authorizer(db, user_name, role_name):
-    role_exists = (
-        True
-        if list(filter(lambda val: val == role_name, db["roles"].keys()))
-        else False
-    )
-    user_exists = (
-        True
-        if list(filter(lambda val: val == user_name, db["users"].keys()))
-        else False
-    )
-
-    if not (role_exists or user_exists):
-        raise ValueError(
-            f"role_name: {role_name} or user_name: {user_name} does not exist in the db."
-        )
-
-    user_roles = db["users"][user_name]["roles"]
-
-    return role_name in user_roles
+from flask import Flask, request, abort, jsonify
+from flask_sqlalchemy import SQLAlchemy
+from passlib.apps import custom_app_context as pass_lib
+from itsdangeorus import JSONWebSignatureSerializer, BadSignature, SignatureExpired
 
 
 app = Flask(__name__)
 
+app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY', '3df9bbf3-1a43-43db-9ebb-f395cf555491')
+app.config['SQLALCHEMY_DATABASE_URI'] = os.environ.get('DATABASE_URI', 'sqlite:///db.sqlite')
+app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
+app.config['SQLALCHEMY_COMMIT_ON_TEARDOWN'] = True
 
-@app.route("/api/users/", methods=["POST"])
+
+db = SQLAlchemy(app)
+token_serializer = JSONWebSignatureSerializer(app.config['SECRET_KEY'])
+
+user_role_table = db.Table(
+    'user_role',
+    db.Column('user_id', db.Integer, db.ForeignKey('user.id')),
+    db.Column('role_id', db.Integer, db.ForeignKey('role.id')),
+)
+
+
+class User(db.Model):
+
+    __tablename__ = 'user'
+
+    id = db.Column(db.Integer, primary_key=True)
+    user_name = db.Column(db.String(32), index=True, unique=True)
+    password = db.Column(db.String(64))
+    is_admin = db.Column(db.Boolean)
+    roles = db.relationship('Role', secondary=user_role_table, backref=db.backref('users', lazy='dynamic'))
+
+    def set_password(self, password):
+        self.password = pass_lib.encrypt(password)
+
+    def authenticate(self, password):
+        return pass_lib.verify(password, self.password)
+
+    def to_dict(self):
+        return {
+            'id': self.id,
+            'user_name': self.user_name,
+            'is_admin': self.is_admin,
+            'roles': [
+                role.to_dict() for role in self.roles
+            ]
+        }
+
+    def get_token(self):
+        return token_serializer.dumps(self.to_dict())
+
+
+class Role(db.Model):
+
+    __tablename__ = 'role'
+
+    id = db.Column(db.Integer, primary_key=True)
+    name = db.Column(db.String(32))
+
+    def to_dict(self):
+        return {
+            'id': self.id,
+            'name': self.name,
+        }
+
+
+def validate_token(token):
+    try:
+        data = token_serializer.loads(token)
+    except BadSignature:
+        return None
+
+    return data
+
+
+@app.route('/api/user', methods=['POST'])
 def create_user_api():
-    if not request.json:
-        return 400
+    user_name = request.json.get('user_name')
+    password = request.json.get('password')
+    is_admin = request.json.get('is_admin')
+    token = request.json.get('auth_token')
 
-    create_user(db, **request.json())
-    return 200
+    if is_admin:
+        user_data = validate_token(token)
+        if not user_data or not user_data['is_admin']:
+            abort(400)
 
+    user = User(user_name=user_name)
+    user.is_admin = is_admin
+    user.set_password(password)
 
-# TODO: User must be authenticated and admin before creating role
-@app.route("/api/roles", methods=["POST"])
-def create_role_api():
-    if not request.json:
-        return 400
+    db.session.add(user)
+    db.session.commit()
 
-    create_user(db, **request.json())
-    return 200
-
-
-@app.route("/api/authenticate", methods=["GET"])
-def authenticate_user_api():
-    user_name = request.args.get("user_name")
-    user_password = request.args.get("user_password")
-
-    return jsonify({"authenticated": euthenticate_user(db, user_name, password)})
+    return jsonify(user.to_dict), 200
 
 
-# TODO: User must be authenticated before authorizing
-@app.route("/api/authorise", methods=["GET"])
-def authorize_user_api():
-    user_name = request.args.get("user_name")
-    role_name = request.args.get("role_name")
+@app.route('/api/user/add_role', methods=['POST'])
+def add_role_api():
+    token = request.json.get('token')
+    role = request.json.get('role')
 
-    return jsonify({"authorized": is_user_authorized(db, user_name, role_name)})
+    user = validate_token(token)
+    if not user:
+        abort(400)
+
+    user = User.query.get(user['id'])
+    role = Role.query.filter(Role.name == role).first()
+
+    user.roles.append(role)
+    db.session.add(user)
+    db.session.commit()
+
+    return jsonify(user.to_dict), 200
 
 
-if __name__ == "__main__":
-    app.run(debug=True)
+@app.route('/api/authenticate', methods=['POST'])
+def authenticate_api():
+    user_name = request.json.get('user_name')
+    password = request.json.get('password')
+
+    if None in (user_name, password):
+        abort(400)
+
+    user = User.query.filter_by(user_name=user_name).first()
+    if user is None:
+        abort(400)
+
+    if not user.authenticate(password):
+        return jsonify({
+            'authenticated': False
+        }), 200
+
+    return jsonify({
+        'authenticated': True,
+        'auth_token': user.get_token()
+    }), 200
+
+
+@app.route('/api/autorize', method=['POST'])
+def authorize_api():
+    token = request.json.get('auth_token')
+    role = request.json.get('role')
+
+    user_data = validate_token(token)
+
+    if not user_data:
+        abort(400)
+
+    if role not in map(lambda data: data['name'], user_data['roles']):
+        return jsonify({
+            'authorized': False
+        }), 200
+
+    return jsonify({
+        'authorized': True
+    }), 200
